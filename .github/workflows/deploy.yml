@@ -35,7 +35,7 @@ jobs:
       - name: Install dependencies & Build
         run: |
           cd frontend
-          npm ci
+          npm install
           npm run build
         env:
           VITE_BASE_PATH: /trustshare/
