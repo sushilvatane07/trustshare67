@@ -399,15 +399,12 @@ export default function LandingPage({ onGetStarted, onSignIn }) {
             </p>
           </div>
 
-          {/* 3D Hero Preview */}
+          {/* Interactive 3D Cyber Vault Canvas */}
           <div className="hero-3d-wrapper">
             <CyberVault3DCanvas />
-            <TiltCard className="dash-preview-card">
-              <img src={hero} className="dash-card-img" alt="TrustShare Dashboard Preview" />
-              <div className="card-glass-badge">
-                <span className="live-dot" /> Live Vault Engine Active
-              </div>
-            </TiltCard>
+            <div className="card-glass-badge hero-vault-badge">
+              <span className="live-dot" /> Live 3D Cryptographic Vault Engine
+            </div>
           </div>
         </div>
       </section>
