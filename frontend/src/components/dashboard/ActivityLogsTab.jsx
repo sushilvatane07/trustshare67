@@ -1,5 +1,6 @@
 import React, { useState, useEffect, useRef } from "react";
 import { fetchWithTimeout } from "../../lib/apiClient";
+import { supabase } from "../../lib/SupabaseClient";
 import { RefreshIcon, SearchIcon, DownloadIcon } from "../Icons";
 
 const API_URL = import.meta.env.VITE_API_URL || "http://localhost:8000";
@@ -16,34 +17,45 @@ export default function ActivityLogsTab({
   const fetchedForUserRef = useRef(null);
 
   async function fetchActivity() {
-    if (!session?.access_token) {
-      setLoading(false);
-      return;
-    }
+    if (!session?.user?.id) { setLoading(false); return; }
     setLoading(true);
     setError(null);
 
-    try {
-      // Route through FastAPI — it uses service_role key to bypass RLS
-      const res = await fetchWithTimeout(
-        `${API_URL}/activity`,
-        { headers: { Authorization: `Bearer ${session.access_token}` } },
-        8000
-      );
+    const isLocalDev = window.location.hostname === "localhost";
 
-      if (res && res.ok) {
-        const data = await res.json();
-        if (Array.isArray(data)) {
-          setActivityLogs(data);
+    // Only hit FastAPI when running locally
+    if (isLocalDev) {
+      try {
+        const res = await fetchWithTimeout(
+          `${API_URL}/activity`,
+          { headers: { Authorization: `Bearer ${session.access_token}` } },
+          3000
+        );
+        if (res?.ok) {
+          const data = await res.json();
+          if (Array.isArray(data)) { setActivityLogs(data); setLoading(false); return; }
         }
-      } else if (res) {
-        const body = await res.json().catch(() => ({}));
-        setError(`Server error ${res.status}: ${body.detail || "Unknown error"}`);
-      } else {
-        setError("Backend unreachable. Check that FastAPI is running on http://localhost:8000");
+      } catch (err) {
+        console.warn("FastAPI activity unavailable, using Supabase directly");
+      }
+    }
+
+    // Direct Supabase query — works on GitHub Pages
+    try {
+      const { data, error: sbErr } = await supabase
+        .from("activity_logs")
+        .select("*")
+        .eq("actor_id", session.user.id)
+        .order("created_at", { ascending: false })
+        .limit(100);
+
+      if (!sbErr && data) {
+        setActivityLogs(data);
+      } else if (sbErr) {
+        setError(`Database error: ${sbErr.message}`);
       }
     } catch (err) {
-      setError("Network error fetching activity logs: " + err.message);
+      setError("Failed to load activity logs: " + err.message);
     } finally {
       setLoading(false);
     }

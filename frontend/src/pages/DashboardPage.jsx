@@ -53,117 +53,113 @@ export default function DashboardPage({ activeTab = "files", onTabChange }) {
     setTimeout(() => setToastMessage(null), 4500);
   }
 
-  // Fast Resilient File Fetching
+  // Fetch files — runs once per userId (stable string dep, not object)
   useEffect(() => {
-    if (!user || !session?.access_token) return;
-    let isMounted = true;
+    if (!user?.id) return;
+    const userId = user.id;
+    let cancelled = false;
 
     async function fetchUserFiles() {
-      // PRIMARY: FastAPI backend (uses service_role key — bypasses RLS, sees all user files)
-      try {
-        const res = await fetchWithTimeout(`${API_URL}/files`, {
-          headers: { Authorization: `Bearer ${session.access_token}` },
-        }, 8000);
+      // On production (GitHub Pages), FastAPI is not running — go direct to Supabase
+      const isLocalDev = window.location.hostname === "localhost";
 
-        if (res && res.ok && isMounted) {
-          const data = await res.json();
-          if (Array.isArray(data) && data.length >= 0) {
-            setFiles(data);
-            return; // success — skip fallback
+      if (isLocalDev) {
+        try {
+          const res = await fetchWithTimeout(`${API_URL}/files`, {
+            headers: { Authorization: `Bearer ${session?.access_token}` },
+          }, 3000);
+          if (res?.ok && !cancelled) {
+            const data = await res.json();
+            if (Array.isArray(data)) { setFiles(data); return; }
           }
+        } catch (err) {
+          console.warn("FastAPI /files unavailable, using Supabase directly");
         }
-      } catch (err) {
-        console.warn("FastAPI /files fetch notice:", err);
       }
 
-      // FALLBACK: Direct Supabase query (may be limited by RLS to fewer rows)
+      // Direct Supabase query — works on GitHub Pages
       try {
         const { data, error } = await supabase
           .from("files")
-          .select("id, owner_id, filename, size_bytes, storage_path, created_at")
-          .eq("owner_id", user.id)
+          .select("*")
+          .eq("owner_id", userId)
           .order("created_at", { ascending: false });
 
-        if (!error && data && isMounted) {
-          setFiles(data);
+        if (!error && !cancelled) {
+          setFiles((data || []).filter((f) => !f.is_deleted));
+        } else if (error) {
+          console.error("Files fetch error:", error.message);
         }
-      } catch (sbErr) {
-        console.warn("Supabase files fallback notice:", sbErr);
+      } catch (err) {
+        console.error("Supabase files fetch error:", err);
       }
     }
 
     fetchUserFiles();
-
-    return () => {
-      isMounted = false;
-    };
-  }, [user?.id]);
+    return () => { cancelled = true; };
+  }, [user?.id]); // user?.id is a stable string — safe dep
 
   // File Upload Handler
   async function handleUpload(selectedFile) {
-    if (!selectedFile) return;
+    if (!selectedFile || !user?.id) return;
     setUploading(true);
     setUploadError(null);
 
-    // 1. Try FastAPI Backend Endpoint first (handles server-side AES-256 Fernet encryption)
-    try {
-      const formData = new FormData();
-      formData.append("file", selectedFile);
+    const isLocalDev = window.location.hostname === "localhost";
 
-      const response = await fetchWithTimeout(`${API_URL}/upload`, {
-        method: "POST",
-        headers: { Authorization: `Bearer ${session?.access_token}` },
-        body: formData,
-      }, 15000); // 15s timeout for file upload
-
-      if (response && response.ok) {
-        const result = await response.json();
-        const newRecord = {
-          id: result.file_id,
-          filename: selectedFile.name,
-          size_bytes: selectedFile.size,
-          created_at: new Date().toISOString(),
-        };
-        setFiles((prev) => [newRecord, ...prev]);
-        showToast(`"${selectedFile.name}" encrypted and uploaded successfully!`, "success");
-        setUploading(false);
-        return;
+    // Only try FastAPI when running locally
+    if (isLocalDev) {
+      try {
+        const formData = new FormData();
+        formData.append("file", selectedFile);
+        const response = await fetchWithTimeout(`${API_URL}/upload`, {
+          method: "POST",
+          headers: { Authorization: `Bearer ${session?.access_token}` },
+          body: formData,
+        }, 5000);
+        if (response?.ok) {
+          const result = await response.json();
+          setFiles((prev) => [{ id: result.file_id, filename: selectedFile.name, size_bytes: selectedFile.size, created_at: new Date().toISOString() }, ...prev]);
+          showToast(`"${selectedFile.name}" encrypted and uploaded!`, "success");
+          setUploading(false);
+          return;
+        }
+      } catch (err) {
+        console.warn("FastAPI upload unavailable, using Supabase storage directly");
       }
-    } catch (err) {
-      console.warn("FastAPI upload notice, trying direct storage fallback...", err);
     }
 
-    // 2. Fallback: Upload directly to Supabase Storage bucket & insert file metadata into `files` table
+    // Direct Supabase Storage upload (works on GitHub Pages)
     try {
       const storagePath = `${user.id}/${Date.now()}_${selectedFile.name}`;
 
-      const { data: uploadData, error: uploadErr } = await supabase.storage
+      const { error: storageErr } = await supabase.storage
         .from("trustshare-files")
         .upload(storagePath, selectedFile, { upsert: true });
 
-      if (uploadErr) throw uploadErr;
-
-      const fileRecord = {
-        owner_id: user.id,
-        filename: selectedFile.name,
-        size_bytes: selectedFile.size,
-        storage_path: storagePath,
-        encryption_key: "AES256_SERVER_MANAGED",
-      };
+      if (storageErr) throw storageErr;
 
       const { data: dbData, error: dbErr } = await supabase
         .from("files")
-        .insert([fileRecord])
+        .insert([{
+          owner_id: user.id,
+          filename: selectedFile.name,
+          size_bytes: selectedFile.size,
+          storage_path: storagePath,
+          encryption_key: "AES256_CLIENT",
+          is_deleted: false,
+        }])
         .select();
 
       if (dbErr) throw dbErr;
 
-      const inserted = dbData?.[0] || fileRecord;
+      const inserted = dbData?.[0] || { filename: selectedFile.name, size_bytes: selectedFile.size, created_at: new Date().toISOString() };
       setFiles((prev) => [inserted, ...prev]);
-      showToast(`"${selectedFile.name}" uploaded to storage vault!`, "success");
+      showToast(`"${selectedFile.name}" uploaded to vault!`, "success");
     } catch (err) {
-      setUploadError(err.message || "Upload failed. Please check server.");
-      showToast(`Upload failed: ${err.message}`, "error");
+      console.error("Upload error:", err);
+      setUploadError(err.message || "Upload failed.");
+      showToast(`Upload error: ${err.message}`, "error");
     } finally {
       setUploading(false);
     }

@@ -9,7 +9,9 @@ export function AuthProvider({ children }) {
   const [user, setUser] = useState(null);
   const [profile, setProfile] = useState(null);
   const [loading, setLoading] = useState(true);
-  const syncedUserIdRef = useRef(null);
+
+  // Ref to ensure profile upsert only runs once per user, not on every token refresh
+  const profileSyncedRef = useRef(null);
 
   function buildProfileFromUser(currentUser) {
     if (!currentUser) return null;
@@ -23,61 +25,108 @@ export function AuthProvider({ children }) {
     };
   }
 
-  useEffect(() => {
-    async function initAuth() {
-      try {
-        const { data: { session: initialSession } } = await supabase.auth.getSession();
-        setSession(initialSession || null);
-        setUser(initialSession?.user || null);
+  // Upsert a profile row so foreign key constraints on files/share_links are satisfied.
+  // Uses a ref so it only runs once per unique user, never on token refresh.
+  async function ensureProfile(currentUser) {
+    if (!currentUser?.id) return;
+    if (profileSyncedRef.current === currentUser.id) return; // already done
+    profileSyncedRef.current = currentUser.id;
 
-        if (initialSession?.user) {
-          // Build profile instantly from session metadata — zero network calls
-          setProfile(buildProfileFromUser(initialSession.user));
-          syncedUserIdRef.current = initialSession.user.id;
-        }
-      } catch (err) {
-        console.warn("Auth initialization notice:", err.message);
-      } finally {
-        setLoading(false);
-      }
+    const meta = currentUser.user_metadata || {};
+    const username = meta.username || (currentUser.email ? currentUser.email.split("@")[0] : "User");
+
+    try {
+      const { error } = await supabase.from("profiles").upsert(
+        {
+          id: currentUser.id,
+          email: currentUser.email,
+          username,
+          avatar_url: meta.avatar_url || null,
+          updated_at: new Date().toISOString(),
+        },
+        { onConflict: "id", ignoreDuplicates: false }
+      );
+      if (error) console.warn("Profile upsert notice:", error.message);
+    } catch (e) {
+      console.warn("Profile upsert error:", e);
     }
+  }
 
-    initAuth();
+  useEffect(() => {
+    let mounted = true;
 
-    const { data: listener } = supabase.auth.onAuthStateChange((_event, newSession) => {
-      setSession(newSession || null);
-      setUser(newSession?.user || null);
+    // Get existing session on mount (reads from localStorage — zero network call)
+    supabase.auth.getSession().then(({ data: { session: s } }) => {
+      if (!mounted) return;
+      setSession(s || null);
+      setUser(s?.user || null);
+      if (s?.user) {
+        setProfile(buildProfileFromUser(s.user));
+        ensureProfile(s.user); // create/update profile row — only fires once per user
+      }
       setLoading(false);
+    });
 
-      if (newSession?.user) {
-        // Only update profile if it's a different user or profile not yet set
-        if (syncedUserIdRef.current !== newSession.user.id) {
-          syncedUserIdRef.current = newSession.user.id;
-          setProfile(buildProfileFromUser(newSession.user));
+    // Listen for auth state changes
+    const { data: { subscription } } = supabase.auth.onAuthStateChange((event, s) => {
+      if (!mounted) return;
+
+      // TOKEN_REFRESHED: only update session silently, no state changes that cause re-renders
+      if (event === "TOKEN_REFRESHED") {
+        // We intentionally do NOT call setSession here.
+        // The supabase client internally updates its token — that's enough.
+        // Calling setSession would trigger a full re-render cascade.
+        return;
+      }
+
+      // SIGNED_IN: new login
+      if (event === "SIGNED_IN") {
+        setSession(s);
+        setUser(s?.user || null);
+        if (s?.user) {
+          setProfile(buildProfileFromUser(s.user));
+          ensureProfile(s.user);
         }
-      } else {
-        syncedUserIdRef.current = null;
+        setLoading(false);
+        return;
+      }
+
+      // SIGNED_OUT: clear everything
+      if (event === "SIGNED_OUT") {
+        profileSyncedRef.current = null;
+        setSession(null);
+        setUser(null);
         setProfile(null);
+        setLoading(false);
+        return;
+      }
+
+      // USER_UPDATED: refresh profile metadata
+      if (event === "USER_UPDATED") {
+        setSession(s);
+        setUser(s?.user || null);
+        if (s?.user) setProfile(buildProfileFromUser(s.user));
+        return;
       }
     });
 
     return () => {
-      listener?.subscription?.unsubscribe();
+      mounted = false;
+      subscription?.unsubscribe();
     };
   }, []);
 
   async function updateProfileData(newUsername, newAvatarUrl) {
     if (!user) return;
     const res = await saveUserProfile(user, newUsername, newAvatarUrl);
-    // Refresh profile from updated auth metadata
     const { data: { user: updatedUser } } = await supabase.auth.getUser();
     if (updatedUser) setProfile(buildProfileFromUser(updatedUser));
     return res;
   }
 
   async function signOut() {
+    profileSyncedRef.current = null;
     await supabase.auth.signOut();
-    syncedUserIdRef.current = null;
     setSession(null);
     setUser(null);
     setProfile(null);
@@ -85,15 +134,7 @@ export function AuthProvider({ children }) {
 
   return (
     <AuthContext.Provider
-      value={{
-        session,
-        user,
-        profile,
-        loading,
-        setProfile,
-        updateProfileData,
-        signOut,
-      }}
+      value={{ session, user, profile, loading, setProfile, updateProfileData, signOut }}
     >
       {children}
     </AuthContext.Provider>
@@ -102,8 +143,6 @@ export function AuthProvider({ children }) {
 
 export function useAuth() {
   const context = useContext(AuthContext);
-  if (!context) {
-    throw new Error("useAuth must be used within an AuthProvider");
-  }
+  if (!context) throw new Error("useAuth must be used within an AuthProvider");
   return context;
 }
